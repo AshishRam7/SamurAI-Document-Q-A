@@ -1,23 +1,21 @@
+import streamlit as st
 import os
 import shutil
 import re
 import uuid
 import requests
-from dotenv import load_dotenv
 from PIL import Image
 import fitz
 from docx import Document
 from pptx import Presentation
-import streamlit as st
 from qdrant_client import models, QdrantClient
 from sentence_transformers import SentenceTransformer
 from qdrant_client.models import PointStruct
 
-load_dotenv()
-
-QDRANT_URL = os.getenv("QDRANT_API_URL")
-QDRANT_API_KEY = os.getenv("QDRANT_API_KEY")
-api_key = os.getenv("GEMINI_API_KEY")
+# Access secrets via st.secrets
+QDRANT_URL = st.secrets["QDRANT_API_URL"]
+QDRANT_API_KEY = st.secrets["QDRANT_API_KEY"]
+api_key = st.secrets["GEMINI_API_KEY"]
 model_name = "gemini-1.5-flash"
 
 def generate_response(api_key, model_name, context, query):
