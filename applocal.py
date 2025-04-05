@@ -5,599 +5,202 @@ import re
 import uuid
 import requests
 from PIL import Image
-import fitz  # PyMuPDF
+import fitz
 from docx import Document
 from pptx import Presentation
-from qdrant_client import models, QdrantClient, QdrantClient,http
-from qdrant_client.http.models import Distance, VectorParams
-from qdrant_client.http.models import PointStruct # Keep this specific import if needed elsewhere
-from qdrant_client.http.exceptions import UnexpectedResponse # For specific error handling
+from qdrant_client import models, QdrantClient
 from sentence_transformers import SentenceTransformer
-import logging # Optional: for better logging
+from qdrant_client.models import PointStruct
 
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
-
-try:
-    QDRANT_URL = st.secrets["QDRANT_API_URL"]
-    QDRANT_API_KEY = st.secrets["QDRANT_API_KEY"]
-    GEMINI_API_KEY = st.secrets["GEMINI_API_KEY"]
-    logging.info("Successfully loaded secrets from st.secrets")
-except KeyError as e:
-    st.error(f"Missing secret: {e}. Please configure secrets in Streamlit Cloud.")
-    logging.error(f"Missing secret: {e}. Please configure secrets in Streamlit Cloud.")
-    st.stop() # Stop execution if secrets are missing
-
-# Gemini Configuration (Consider using the official google-generativeai library later)
-GEMINI_MODEL_NAME = "gemini-2.0-flash" # Verify this model is available and enabled for your key
-
-# Qdrant Configuration
-QDRANT_COLLECTION_NAME = "my_documents"
-
-# Sentence Transformer Configuration
-ENCODER_MODEL_NAME = "sentence-transformers/all-MiniLM-L6-v2"
-
-# Directories
-UPLOAD_DIR = "input_files"
-IMAGE_OUTPUT_DIR = "extracted_images"
-
-# --- Helper Functions ---
+# Access secrets via st.secrets
+QDRANT_URL = st.secrets["QDRANT_API_URL"]
+QDRANT_API_KEY = st.secrets["QDRANT_API_KEY"]
+api_key = st.secrets["GEMINI_API_KEY"]
+model_name = "gemini-1.5-flash"
 
 def generate_response(api_key, model_name, context, query):
-    """Generates a response using the Gemini API."""
     url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent?key={api_key}"
-    context_text = "\n".join(context) # Ensure context is a single string
+    context_text = "\n".join(context)
     headers = {"Content-Type": "application/json"}
     prompt_text = f"""
-You are a helpful AI assistant specialized in answering questions based on provided documents.
-Use ONLY the following context to answer the question precisely and concisely, using bullet points if appropriate.
-If the context does not contain the answer, state that the information is not available in the provided documents.
-
-Context:
----
-{context_text}
----
-
-Question: {query}
-
-Answer:
-"""
-    payload = {"contents": [{"parts": [{"text": prompt_text}]}]}
+    You are a helpful AI assistant. Use the following context to answer the question precisely and in detail in points.
     
-    logging.info(f"Sending request to Gemini API. Query: {query}")
-    # logging.debug(f"Gemini Payload: {payload}") # Uncomment for verbose debugging
-
+    Context: {context_text}
+    
+    Question: {query}
+    
+    Answer:
+    """
+    payload = {"contents": [{"parts": [{"text": prompt_text}]}]}
     try:
-        response = requests.post(url, headers=headers, json=payload, timeout=60) # Added timeout
-        response.raise_for_status() # Raise an exception for bad status codes (4xx or 5xx)
-        
-        response_json = response.json()
-        # logging.debug(f"Gemini Response JSON: {response_json}") # Uncomment for verbose debugging
-
-        if 'candidates' in response_json and response_json['candidates']:
-            # Check for safety ratings or blocked content
-            candidate = response_json['candidates'][0]
-            if 'content' in candidate and 'parts' in candidate['content']:
-                 generated_text = candidate['content']['parts'][0]['text']
-                 logging.info("Successfully received response from Gemini API.")
-                 return generated_text
-            elif 'finishReason' in candidate and candidate['finishReason'] != 'STOP':
-                 # Handle cases like safety blocks, etc.
-                 logging.warning(f"Gemini response finished with reason: {candidate.get('finishReason', 'N/A')}")
-                 return f"Could not generate response. Reason: {candidate.get('finishReason', 'Unknown')}"
+        response = requests.post(url, headers=headers, json=payload)
+        if response.ok:
+            response_json = response.json()
+            if 'candidates' in response_json and response_json['candidates']:
+                return response_json['candidates'][0]['content']['parts'][0]['text']
             else:
-                 logging.warning("Gemini response format unexpected (no content/parts).")
-                 return "Error: Received an unexpected response format from the AI."
-        elif 'promptFeedback' in response_json and 'blockReason' in response_json['promptFeedback']:
-             block_reason = response_json['promptFeedback']['blockReason']
-             logging.warning(f"Prompt blocked by Gemini API. Reason: {block_reason}")
-             return f"Error: The prompt was blocked by the AI. Reason: {block_reason}"
+                return "No candidates found in the response."
         else:
-            logging.warning(f"No candidates found in Gemini response. Full response: {response_json}")
-            return "Error: No response generated by the AI."
-            
-    except requests.exceptions.RequestException as e:
-        logging.error(f"Gemini API request failed: {e}")
-        # Provide more specific feedback if possible (e.g., check API key, model name)
-        if isinstance(e, requests.exceptions.HTTPError):
-             return f"Error calling AI model: {e.response.status_code} - {e.response.text}"
-        return f"An error occurred connecting to the AI service: {str(e)}"
+            return f"Error: {response.status_code}\n{response.text}"
     except Exception as e:
-        logging.error(f"An unexpected error occurred during Gemini response generation: {str(e)}")
-        return f"An unexpected error occurred: {str(e)}"
-
-def clean_text(text):
-    """Cleans text by removing extra whitespace and non-ASCII characters."""
-    if not isinstance(text, str):
-        return ""
-    text = re.sub(r'\s+', ' ', text) # Replace multiple whitespace with single space
-    text = re.sub(r'[^\x00-\x7F]+', '', text) # Remove non-ASCII characters
-    return text.strip()
-
-def extract_text_and_images_from_pdf(pdf_path, file_name_base, image_output_dir):
-    """Extracts text and images from a PDF file."""
-    extracted_text = ""
-    try:
-        with fitz.open(pdf_path) as pdf:
-            for page_number, page in enumerate(pdf):
-                text = page.get_text("text") # Get plain text
-                extracted_text += clean_text(text) + "\n" # Add newline between pages
-                
-                image_list = page.get_images(full=True)
-                for img_index, img in enumerate(image_list):
-                    xref = img[0]
-                    try:
-                        base_image = pdf.extract_image(xref)
-                        if base_image: # Check if image extraction was successful
-                            image_bytes = base_image["image"]
-                            image_ext = base_image["ext"]
-                            # Sanitize filename components
-                            safe_file_name = re.sub(r'[^\w\-]+', '_', file_name_base)
-                            image_filename = os.path.join(image_output_dir, f"{safe_file_name}_page{page_number+1}_img{img_index+1}.{image_ext}")
-                            with open(image_filename, "wb") as image_file:
-                                image_file.write(image_bytes)
-                        else:
-                             logging.warning(f"Could not extract image {img_index+1} (xref: {xref}) from page {page_number+1} of {file_name_base}.pdf")
-                    except Exception as img_e:
-                         logging.error(f"Error processing image {img_index+1} (xref: {xref}) on page {page_number+1} of {file_name_base}.pdf: {img_e}")
-        logging.info(f"Successfully extracted text and images from PDF: {file_name_base}.pdf")
-    except Exception as e:
-        logging.error(f"Error processing PDF file {pdf_path}: {e}")
-        st.warning(f"Could not process PDF: {os.path.basename(pdf_path)}. Error: {e}")
-    return extracted_text
-
-def extract_text_and_images_from_word(word_path, file_name_base, image_output_dir):
-    """Extracts text and images from a DOCX file."""
-    extracted_text = ""
-    try:
-        doc = Document(word_path)
-        for para in doc.paragraphs:
-            extracted_text += clean_text(para.text) + "\n" # Add newline between paragraphs
-        
-        # Extract images (if any) - This gets images linked via relationships
-        img_counter = 1
-        for rel in doc.part.rels.values():
-            if "image" in rel.target_ref:
-                 try:
-                     image_part = rel.target_part
-                     image_bytes = image_part.blob
-                     image_ext = image_part.content_type.split('/')[-1] # e.g., png, jpeg
-                     if image_ext not in ['png', 'jpeg', 'jpg', 'gif', 'bmp']:
-                         image_ext = 'png' # Default extension if type is unknown/weird
-
-                     # Sanitize filename components
-                     safe_file_name = re.sub(r'[^\w\-]+', '_', file_name_base)
-                     image_filename = os.path.join(image_output_dir, f"{safe_file_name}_img{img_counter}.{image_ext}")
-                     with open(image_filename, "wb") as img_file:
-                         img_file.write(image_bytes)
-                     img_counter += 1
-                 except Exception as img_e:
-                     logging.error(f"Error extracting image {img_counter} from DOCX {file_name_base}.docx: {img_e}")
-        logging.info(f"Successfully extracted text and images from DOCX: {file_name_base}.docx")
-    except Exception as e:
-        logging.error(f"Error processing DOCX file {word_path}: {e}")
-        st.warning(f"Could not process DOCX: {os.path.basename(word_path)}. Error: {e}")
-    return extracted_text
-
-def extract_text_and_images_from_ppt(ppt_path, file_name_base, image_output_dir):
-    """Extracts text and images from a PPTX file."""
-    extracted_text = ""
-    try:
-        prs = Presentation(ppt_path)
-        img_counter = 1
-        for slide_number, slide in enumerate(prs.slides):
-            slide_text = ""
-            for shape in slide.shapes:
-                if hasattr(shape, "text") and shape.text:
-                    slide_text += clean_text(shape.text) + " "
-                # Extract images (shape type 13 is Picture)
-                if shape.shape_type == 13: # 13 corresponds to Picture shape type
-                    try:
-                        image = shape.image
-                        image_bytes = image.blob
-                        image_ext = image.ext # pptx library conveniently provides extension
-
-                        # Sanitize filename components
-                        safe_file_name = re.sub(r'[^\w\-]+', '_', file_name_base)
-                        image_filename = os.path.join(image_output_dir, f"{safe_file_name}_slide{slide_number+1}_img{img_counter}.{image_ext}")
-                        with open(image_filename, "wb") as img_file:
-                            img_file.write(image_bytes)
-                        img_counter += 1
-                    except Exception as img_e:
-                         logging.error(f"Error extracting image {img_counter} from slide {slide_number+1} of PPTX {file_name_base}.pptx: {img_e}")
-            extracted_text += slide_text.strip() + "\n" # Add newline between slides
-        logging.info(f"Successfully extracted text and images from PPTX: {file_name_base}.pptx")
-    except Exception as e:
-        logging.error(f"Error processing PPTX file {ppt_path}: {e}")
-        st.warning(f"Could not process PPTX: {os.path.basename(ppt_path)}. Error: {e}")
-    return extracted_text.strip() # Remove trailing newline
+        return f"An error occurred: {str(e)}"
 
 def process_documents(input_directory, image_output_dir="extracted_images"):
-    """Processes all supported documents in a directory."""
-    # Ensure clean state for images (optional, depends on desired behavior)
     if os.path.exists(image_output_dir):
-        try:
-            shutil.rmtree(image_output_dir)
-            logging.info(f"Removed existing image directory: {image_output_dir}")
-        except OSError as e:
-            logging.error(f"Error removing directory {image_output_dir}: {e}")
-            st.warning(f"Could not clear old images directory: {e}")
-    try:
-        os.makedirs(image_output_dir, exist_ok=True)
-        logging.info(f"Ensured image directory exists: {image_output_dir}")
-    except OSError as e:
-        logging.error(f"Error creating directory {image_output_dir}: {e}")
-        st.error(f"Fatal Error: Could not create image directory: {e}")
-        st.stop()
-
-
-    extracted_data = {} # Dictionary to store {filename_base: text}
-    logging.info(f"Starting document processing in directory: {input_directory}")
-    
-    if not os.path.exists(input_directory) or not os.listdir(input_directory):
-         logging.warning(f"Input directory {input_directory} is empty or does not exist.")
-         return extracted_data # Return empty dict if no files
-
-    for filename in os.listdir(input_directory):
-        file_path = os.path.join(input_directory, filename)
-        if os.path.isfile(file_path): # Ensure it's a file
-            file_name_base, file_ext = os.path.splitext(filename)
-            file_ext_lower = file_ext.lower()
-            
-            logging.info(f"Processing file: {filename}")
-            
-            text = ""
-            if file_ext_lower == '.pdf':
-                text = extract_text_and_images_from_pdf(file_path, file_name_base, image_output_dir)
-            elif file_ext_lower == '.docx':
-                text = extract_text_and_images_from_word(file_path, file_name_base, image_output_dir)
-            elif file_ext_lower == '.pptx':
-                text = extract_text_and_images_from_ppt(file_path, file_name_base, image_output_dir)
-            else:
-                 logging.warning(f"Skipping unsupported file type: {filename}")
-                 continue # Skip unsupported files
-
-            if text: # Only add if text was extracted
-                 extracted_data[file_name_base] = text
-            else:
-                 logging.warning(f"No text extracted from file: {filename}")
-
-    logging.info(f"Finished document processing. Extracted text from {len(extracted_data)} files.")
+        shutil.rmtree(image_output_dir)
+    os.makedirs(image_output_dir, exist_ok=True)
+    extracted_data = {}
+    for root, _, files in os.walk(input_directory):
+        for file in files:
+            file_path = os.path.join(root, file)
+            file_name, file_ext = os.path.splitext(file)
+            if file_ext.lower() == '.pdf':
+                text = extract_text_and_images_from_pdf(file_path, file_name, image_output_dir)
+                extracted_data[file_name] = text
+            elif file_ext.lower() == '.docx':
+                text = extract_text_and_images_from_word(file_path, file_name, image_output_dir)
+                extracted_data[file_name] = text
+            elif file_ext.lower() == '.pptx':
+                text = extract_text_and_images_from_ppt(file_path, file_name, image_output_dir)
+                extracted_data[file_name] = text
     return extracted_data
 
-def split_text(text, chunk_size=800, chunk_overlap=100): # Adjusted overlap slightly
-    """Splits text into overlapping chunks."""
-    if not text:
-        return []
+def clean_text(text):
+    text = re.sub(r'\s+', ' ', text)
+    text = re.sub(r'[^\x00-\x7F]+', '', text)
+    return text.strip()
+
+def extract_text_and_images_from_pdf(pdf_path, file_name, image_output_dir):
+    extracted_text = ""
+    with fitz.open(pdf_path) as pdf:
+        for page_number, page in enumerate(pdf):
+            text = page.get_text()
+            extracted_text += clean_text(text) + " "
+            for img_index, img in enumerate(page.get_images(full=True)):
+                xref = img[0]
+                base_image = pdf.extract_image(xref)
+                image_bytes = base_image["image"]
+                image_ext = base_image["ext"]
+                image_filename = os.path.join(image_output_dir, f"{file_name}_page{page_number+1}_img{img_index+1}.{image_ext}")
+                with open(image_filename, "wb") as image_file:
+                    image_file.write(image_bytes)
+    return extracted_text
+
+def extract_text_and_images_from_word(word_path, file_name, image_output_dir):
+    extracted_text = ""
+    doc = Document(word_path)
+    for para in doc.paragraphs:
+        extracted_text += clean_text(para.text) + " "
+    for rel in doc.part.rels.values():
+        if "image" in rel.reltype:
+            image_part = rel.target_part
+            image_data = image_part.blob
+            image_filename = os.path.join(image_output_dir, f"{file_name}_img{rel.rId}.png")
+            with open(image_filename, "wb") as img_file:
+                img_file.write(image_data)
+    return extracted_text
+
+def extract_text_and_images_from_ppt(ppt_path, file_name, image_output_dir):
+    extracted_text = ""
+    prs = Presentation(ppt_path)
+    for slide_number, slide in enumerate(prs.slides):
+        for shape in slide.shapes:
+            if hasattr(shape, "text"):
+                extracted_text += clean_text(shape.text) + " "
+            if shape.shape_type == 13:
+                image = shape.image
+                image_bytes = image.blob
+                image_filename = os.path.join(image_output_dir, f"{file_name}_slide{slide_number+1}_img{shape.shape_id}.png")
+                with open(image_filename, "wb") as img_file:
+                    img_file.write(image_bytes)
+    return extracted_text
+
+def split_text(text, chunk_size=800, chunk_overlap=110):
     chunks = []
     start = 0
     while start < len(text):
         end = start + chunk_size
         chunk = text[start:end]
         chunks.append(chunk)
-        # Move start forward, ensuring overlap, but prevent infinite loops on short texts
-        next_start = start + chunk_size - chunk_overlap
-        if next_start <= start: # Prevent getting stuck if overlap >= chunk_size
-             next_start = start + 1
-        start = next_start
-
-    # Filter out very small or empty chunks that might result from the overlap logic
-    return [c for c in chunks if len(c.strip()) > 10] # Keep chunks with some substance
-
-
-@st.cache_resource # Cache the encoder model
-def get_encoder(model_name):
-    """Loads and returns the sentence transformer model."""
-    logging.info(f"Loading sentence transformer model: {model_name}")
-    try:
-        encoder = SentenceTransformer(model_name)
-        logging.info("Sentence transformer model loaded successfully.")
-        return encoder
-    except Exception as e:
-        logging.error(f"Failed to load sentence transformer model {model_name}: {e}")
-        st.error(f"Fatal Error: Could not load embedding model. {e}")
-        st.stop()
-
-@st.cache_resource # Cache the Qdrant client connection
-def get_qdrant_client(url, api_key):
-    """Initializes and returns the Qdrant client."""
-    logging.info(f"Initializing Qdrant client for URL: {url}")
-    try:
-        client = QdrantClient(url=url, api_key=api_key, timeout=60) # Increased timeout
-        # Optional: Verify connection (e.g., list collections)
-        # client.list_collections() 
-        logging.info("Qdrant client initialized successfully.")
-        return client
-    except Exception as e:
-        logging.error(f"Failed to initialize Qdrant client: {e}")
-        st.error(f"Fatal Error: Could not connect to Qdrant. Check URL/Key. Error: {e}")
-        st.stop()
-
-def ensure_collection_exists(client: QdrantClient, collection_name: str, vector_size: int, distance_metric: Distance = Distance.COSINE):
-    """Checks if a collection exists and creates it if it doesn't."""
-    logging.info(f"Ensuring Qdrant collection '{collection_name}' exists.")
-    try:
-        client.get_collection(collection_name=collection_name)
-        logging.info(f"Collection '{collection_name}' already exists.")
-    except UnexpectedResponse as e:
-         # This specific exception often indicates "Not Found" for get_collection
-        if e.status_code == 404:
-            logging.warning(f"Collection '{collection_name}' not found. Attempting to create it.")
-            try:
-                client.create_collection(
-                    collection_name=collection_name,
-                    vectors_config=VectorParams(size=vector_size, distance=distance_metric)
-                )
-                logging.info(f"Successfully created collection '{collection_name}' with vector size {vector_size} and distance {distance_metric}.")
-                # Short pause after creation (optional, might help consistency)
-                # import time
-                # time.sleep(1)
-            except Exception as create_e:
-                logging.error(f"Failed to create collection '{collection_name}': {create_e}")
-                st.error(f"Fatal Error: Could not create required Qdrant collection '{collection_name}'. Error: {create_e}")
-                st.stop()
-        else:
-             # Re-raise other unexpected responses during the check
-             logging.error(f"Error checking collection '{collection_name}': {e}")
-             st.error(f"Fatal Error: Could not verify Qdrant collection '{collection_name}'. Status: {e.status_code}. Error: {e}")
-             st.stop()
-    except Exception as e:
-         # Handle other potential errors during get_collection (network issues, etc.)
-         logging.error(f"An unexpected error occurred while checking collection '{collection_name}': {e}")
-         st.error(f"Fatal Error: An unexpected error occurred while checking Qdrant collection '{collection_name}'. Error: {e}")
-         st.stop()
-
-
-# --- Main Streamlit App ---
+        start = end - chunk_overlap
+    return chunks
 
 def main():
-    st.set_page_config(page_title="SamurAI - Document Q&A", page_icon="🥷", layout="wide", initial_sidebar_state="expanded")
-    st.title("🥷 SamurAI - Document Q&A")
-    st.markdown("Upload your PDF, DOCX, or PPTX documents, then ask questions about their content.")
-
-    # --- Initialization ---
-    # Create necessary directories
+    UPLOAD_DIR = "input_files"
+    image_output_directory = "extracted_images"
     os.makedirs(UPLOAD_DIR, exist_ok=True)
-    # IMAGE_OUTPUT_DIR is created/cleared within process_documents
+    os.makedirs(image_output_directory, exist_ok=True)
 
-    # Load Encoder and Qdrant Client (cached)
-    encoder = get_encoder(ENCODER_MODEL_NAME)
-    qdrant_client = get_qdrant_client(QDRANT_URL, QDRANT_API_KEY)
+    qdrant_client = QdrantClient(url=QDRANT_URL, api_key=QDRANT_API_KEY)
+    encoder = SentenceTransformer("sentence-transformers/all-MiniLM-L6-v2")
 
-    # Ensure Qdrant collection exists (critical step!)
-    try:
-         vector_size = encoder.get_sentence_embedding_dimension()
-         ensure_collection_exists(qdrant_client, QDRANT_COLLECTION_NAME, vector_size)
-    except AttributeError:
-         # Fallback if get_sentence_embedding_dimension is not available (older sentence-transformers)
-         # You might need to hardcode the dimension based on the model if this fails
-         try:
-             # Try encoding a dummy sentence to get the size
-             dummy_embedding = encoder.encode("test")
-             vector_size = len(dummy_embedding)
-             logging.warning(f"Used dummy encoding to determine vector size: {vector_size}")
-             ensure_collection_exists(qdrant_client, QDRANT_COLLECTION_NAME, vector_size)
-         except Exception as dim_e:
-              logging.error(f"Could not determine vector size for model {ENCODER_MODEL_NAME}: {dim_e}")
-              st.error(f"Fatal Error: Could not determine vector size for the embedding model. Error: {dim_e}")
-              st.stop()
-
-
-    # --- Session State Management ---
     if 'session_id' not in st.session_state:
         st.session_state.session_id = str(uuid.uuid4())
-        logging.info(f"New session started: {st.session_state.session_id}")
     if 'messages' not in st.session_state:
-        st.session_state.messages = [] # Stores {'user': question, 'bot': answer} dicts
-    if 'uploaded_files_processed' not in st.session_state:
-         st.session_state.uploaded_files_processed = False # Flag to track processing
-    if 'extracted_image_paths' not in st.session_state:
-        st.session_state.extracted_image_paths = []
+        st.session_state.messages = []
 
-    # --- Sidebar: File Upload ---
-    with st.sidebar:
-        st.header("Upload Documents")
-        uploaded_files = st.sidebar.file_uploader(
-            "Choose documents (PDF, DOCX, PPTX)",
-            type=["pdf", "docx", "pptx"],
-            accept_multiple_files=True,
-            key="file_uploader" # Assign a key for potential state management
-        )
-
-        if uploaded_files and not st.session_state.uploaded_files_processed:
-            # Clear previous uploads and state before processing new ones
-            logging.info(f"Processing {len(uploaded_files)} newly uploaded file(s). Clearing old data.")
-            st.session_state.messages = [] # Clear chat history on new upload
-            st.session_state.extracted_image_paths = [] # Clear old images
-            
-            # Clear the upload directory
-            if os.path.exists(UPLOAD_DIR):
-                for filename in os.listdir(UPLOAD_DIR):
-                    try:
-                        os.remove(os.path.join(UPLOAD_DIR, filename))
-                    except OSError as e:
-                         logging.warning(f"Could not remove old file {filename}: {e}")
-
-
-            # Save new files
-            saved_files_count = 0
-            for uploaded_file in uploaded_files:
-                try:
-                    file_path = os.path.join(UPLOAD_DIR, uploaded_file.name)
-                    with open(file_path, "wb") as f:
-                        f.write(uploaded_file.getvalue())
-                    saved_files_count += 1
-                    logging.info(f"Saved uploaded file: {uploaded_file.name}")
-                except Exception as e:
-                    logging.error(f"Error saving uploaded file {uploaded_file.name}: {e}")
-                    st.sidebar.error(f"Error saving {uploaded_file.name}")
-
-            if saved_files_count > 0:
-                 st.sidebar.success(f"Saved {saved_files_count} file(s) for processing.")
-                 
-                 # --- Processing and Indexing ---
-                 with st.spinner("SamurAI is analyzing documents... Please wait."):
-                    try:
-                        # Process documents to get text
-                        docs_data = process_documents(UPLOAD_DIR, IMAGE_OUTPUT_DIR)
-
-                        # Get list of extracted images AFTER processing
-                        st.session_state.extracted_image_paths = [os.path.join(IMAGE_OUTPUT_DIR, img) for img in os.listdir(IMAGE_OUTPUT_DIR) if os.path.isfile(os.path.join(IMAGE_OUTPUT_DIR, img))]
-
-                        # Prepare points for Qdrant
-                        all_points_to_upsert = []
-                        point_id_counter = 0 # Use a simple counter for unique IDs within this batch
-
-                        for file_name_base, text in docs_data.items():
-                            if not text or text.isspace():
-                                 logging.warning(f"Skipping empty text content for: {file_name_base}")
-                                 continue
-                                 
-                            chunks = split_text(text)
-                            logging.info(f"Split '{file_name_base}' into {len(chunks)} chunks.")
-                            
-                            if not chunks:
-                                 logging.warning(f"No text chunks generated for: {file_name_base}")
-                                 continue
-
-                            # Encode chunks in batches (more efficient)
-                            chunk_embeddings = encoder.encode(chunks, show_progress_bar=False) # Set to True for visible progress
-
-                            for i, chunk in enumerate(chunks):
-                                embedding = chunk_embeddings[i].tolist() # Convert numpy array to list
-                                point_id = f"{st.session_state.session_id}-{file_name_base}-{point_id_counter}" # Create a more robust unique ID
-                                
-                                all_points_to_upsert.append(PointStruct(
-                                    id=point_id, # Use generated unique ID
-                                    vector=embedding,
-                                    payload={
-                                        "text": chunk,
-                                        "document_name": file_name_base, # Store original filename base
-                                        "session_id": st.session_state.session_id # Associate with session
-                                    }
-                                ))
-                                point_id_counter += 1
-
-                        # Upsert points to Qdrant in batches
-                        if all_points_to_upsert:
-                            logging.info(f"Upserting {len(all_points_to_upsert)} points to Qdrant collection '{QDRANT_COLLECTION_NAME}'.")
-                            # Upsert in batches of 100 (adjust size as needed)
-                            batch_size = 100 
-                            for i in range(0, len(all_points_to_upsert), batch_size):
-                                batch = all_points_to_upsert[i : i + batch_size]
-                                try:
-                                    qdrant_client.upsert(
-                                         collection_name=QDRANT_COLLECTION_NAME, 
-                                         points=batch, 
-                                         wait=True # Wait for operation to complete for consistency
-                                         )
-                                    logging.info(f"Upserted batch {i//batch_size + 1} to Qdrant.")
-                                except UnexpectedResponse as q_err:
-                                     logging.error(f"Qdrant upsert failed with status {q_err.status_code}: {q_err.content}")
-                                     st.error(f"Error storing document data (Qdrant {q_err.status_code}). Please check Qdrant connection/logs.")
-                                     # Decide if you want to stop or just warn
-                                except Exception as q_err:
-                                     logging.error(f"An unexpected error occurred during Qdrant upsert: {q_err}")
-                                     st.error(f"An unexpected error occurred while storing document data: {q_err}")
-                                     # Decide if you want to stop or just warn
-                            st.sidebar.success("✅ Documents processed and indexed!")
-                            st.session_state.uploaded_files_processed = True # Mark as processed
-                        else:
-                             st.sidebar.warning("⚠️ No text content found in the uploaded documents to index.")
-                             st.session_state.uploaded_files_processed = False # No data indexed
-
-
-                    except Exception as e:
-                         logging.error(f"Error during document processing or indexing: {e}", exc_info=True)
-                         st.sidebar.error(f"An error occurred during processing: {e}")
-                         st.session_state.uploaded_files_processed = False # Failed
-                 
-                 # Trigger a rerun to update the main page state (e.g., show images)
-                 st.rerun()
-
-
-    # --- Main Area: Chat Interface and Images ---
+    st.set_page_config(page_title="SamurAI - Document Q&A", page_icon="🥷", layout="wide", initial_sidebar_state="expanded")
+    st.title("🥷SamurAI - Document Q&A Chat Bot")
     
-    # Display extracted images if any
-    if st.session_state.extracted_image_paths:
-         st.subheader("Extracted Images")
-         # Use st.columns for better layout, adjust number of columns as needed
-         num_columns = 5
-         cols = st.columns(num_columns)
-         for i, img_path in enumerate(st.session_state.extracted_image_paths):
-             try:
-                 with cols[i % num_columns]:
-                     st.image(img_path, caption=os.path.basename(img_path), use_container_width=True)
-             except Exception as img_disp_e:
-                 logging.warning(f"Could not display image {img_path}: {img_disp_e}")
-                 with cols[i % num_columns]:
-                      st.caption(f"Error loading {os.path.basename(img_path)}")
+    st.sidebar.header("Upload Documents")
+    uploaded_files = st.sidebar.file_uploader("Choose documents", type=["pdf", "docx", "pptx"], accept_multiple_files=True)
 
+    if uploaded_files:
+        for filename in os.listdir(UPLOAD_DIR):
+            os.remove(os.path.join(UPLOAD_DIR, filename))
+        for uploaded_file in uploaded_files:
+            file_path = os.path.join(UPLOAD_DIR, uploaded_file.name)
+            with open(file_path, "wb") as f:
+                f.write(uploaded_file.getvalue())
+        st.sidebar.success(f"Uploaded {len(uploaded_files)} file(s)")
+        with st.spinner("Processing documents..."):
+            docs = process_documents(UPLOAD_DIR, image_output_directory)
+            for file_name, text in docs.items():
+                chunks = split_text(text)
+                batch_points = []
+                for i, chunk in enumerate(chunks):
+                    embedding = encoder.encode(chunk)
+                    batch_points.append(PointStruct(
+                        id=len(batch_points), 
+                        vector=embedding,
+                        payload={
+                            "text": chunk,
+                            "document_name": file_name,
+                            "session_id": st.session_state.session_id
+                        }
+                    ))
+                for i in range(0, len(batch_points), 100):
+                    batch = batch_points[i:i+100]
+                    qdrant_client.upsert(collection_name="my_documents", points=batch)
+        images = [os.path.join(image_output_directory, img) for img in os.listdir(image_output_directory)]
+        if images:
+            st.write("### Extracted Images")
+            cols = st.columns(4)
+            for i, img_path in enumerate(images):
+                with cols[i % 4]:
+                    st.image(img_path, use_container_width=True)
 
-    st.divider()
-    st.subheader("Ask Questions About Your Documents")
+    st.write("### Ask Questions about Your Documents")
+    user_question = st.text_input("Enter your question here")
 
-    # Display chat history
-    if st.session_state.messages:
-        for message in st.session_state.messages:
-             with st.chat_message("user"):
-                 st.markdown(message['user'])
-             with st.chat_message("assistant", avatar="🥷"): # Custom avatar
-                 st.markdown(message['bot'])
+    if st.button("Ask") and user_question:
+        try:
+            query_embedding = encoder.encode(user_question).tolist()
+            session_id = st.session_state.session_id
+            sessionFilter = models.Filter(must=[models.FieldCondition(key="session_id", match=models.MatchValue(value=session_id))])
+            search_result = qdrant_client.search(
+                collection_name="my_documents", query_vector=query_embedding, query_filter=sessionFilter, limit=8
+            )
+            retrieved_context = "\n".join([hit.payload['text'] for hit in search_result])
+            bot_response = generate_response(api_key, model_name, retrieved_context, user_question)
+            st.session_state.messages.append({'user': user_question, 'bot': bot_response})
+        except Exception as e:
+            st.error(f"Error processing query: {e}")
 
-    # Chat input
-    user_question = st.chat_input("Enter your question here...", key="chat_input")
-
-    if user_question:
-         if not st.session_state.uploaded_files_processed:
-              st.warning("Please upload and process documents before asking questions.")
-         else:
-             st.chat_message("user").markdown(user_question)
-             
-             # --- Retrieval and Generation ---
-             with st.spinner("SamurAI is searching documents and formulating an answer..."):
-                try:
-                    # 1. Encode the user's question
-                    query_embedding = encoder.encode(user_question).tolist()
-                    
-                    # 2. Search Qdrant for relevant context, filtering by session_id
-                    session_id = st.session_state.session_id
-                    search_filter = models.Filter(
-                        must=[
-                            models.FieldCondition(
-                                key="session_id", 
-                                match=models.MatchValue(value=session_id)
-                            )
-                        ]
-                    )
-                    
-                    logging.info(f"Searching Qdrant for question: '{user_question}' with session_id: {session_id}")
-                    search_result = qdrant_client.search(
-                        collection_name=QDRANT_COLLECTION_NAME,
-                        query_vector=query_embedding,
-                        query_filter=search_filter,
-                        limit=5
-                    )
-                    
-                    retrieved_context = [hit.payload['text'] for hit in search_result if hit.payload and 'text' in hit.payload]
-                    
-                    if not retrieved_context:
-                         logging.warning("No relevant context found in Qdrant for the query.")
-                         bot_response = "I couldn't find relevant information in the uploaded documents to answer your question."
-                    else:
-                         logging.info(f"Retrieved {len(retrieved_context)} context chunks from Qdrant.")
-                         # logging.debug(f"Retrieved context: {retrieved_context}") # Uncomment for debugging
-                         
-                         # 4. Generate response using Gemini with retrieved context
-                         bot_response = generate_response(GEMINI_API_KEY, GEMINI_MODEL_NAME, retrieved_context, user_question)
-                         
-                except Exception as e:
-                    logging.error(f"Error processing query '{user_question}': {e}", exc_info=True)
-                    bot_response = f"An error occurred while processing your question: {e}"
-
-             
-             with st.chat_message("assistant", avatar="🥷"):
-                 st.markdown(bot_response)
-             st.session_state.messages.append({'user': user_question, 'bot': bot_response})
+    st.write("### Chat History")
+    for message in st.session_state.messages:
+        st.markdown(f"""<div style=\"background-color: #282828; padding: 10px; margin-bottom: 10px; border-radius: 5px;\"><strong>You:</strong> {message['user']}</div>""", unsafe_allow_html=True)
+        st.markdown(f"""<div style=\"background-color: #282828; padding: 10px; margin-bottom: 10px; border-radius: 5px;\"><strong>SamurAI:</strong> {message['bot']}</div>""", unsafe_allow_html=True)
 
 if __name__ == "__main__":
     main()
